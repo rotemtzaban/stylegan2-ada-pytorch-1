@@ -490,6 +490,7 @@ class SynthesisNetwork(torch.nn.Module):
             for res in self.block_resolutions:
                 block = getattr(self, f'b{res}')
                 cur_styles = styles[w_idx : w_idx + block.num_conv + block.num_torgb]
+                w_idx += block.num_conv + block.num_torgb
                 x, img = block(x, img, cur_styles, style_input=style_input, **block_kwargs)
         return img
 
