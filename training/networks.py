@@ -283,11 +283,14 @@ class SynthesisLayer(torch.nn.Module):
             self.noise_strength = torch.nn.Parameter(torch.zeros([]))
         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
 
-    def forward(self, x, w, noise_mode='random', fused_modconv=True, gain=1):
+    def forward(self, x, w, style_input=False, noise_mode='random', fused_modconv=True, gain=1):
         assert noise_mode in ['random', 'const', 'none']
         in_resolution = self.resolution // self.up
         misc.assert_shape(x, [None, self.weight.shape[1], in_resolution, in_resolution])
-        styles = self.affine(w)
+        if style_input:
+            styles = self.affine(w)
+        else:
+            styles = w
 
         noise = None
         if self.use_noise and noise_mode == 'random':
@@ -376,9 +379,14 @@ class SynthesisBlock(torch.nn.Module):
             self.skip = Conv2dLayer(in_channels, out_channels, kernel_size=1, bias=False, up=2,
                 resample_filter=resample_filter, channels_last=self.channels_last)
 
-    def forward(self, x, img, ws, force_fp32=False, fused_modconv=None, **layer_kwargs):
-        misc.assert_shape(ws, [None, self.num_conv + self.num_torgb, self.w_dim])
-        w_iter = iter(ws.unbind(dim=1))
+    def forward(self, x, img, ws, style_input=False, force_fp32=False, fused_modconv=None, **layer_kwargs):
+        if not style_input:
+            misc.assert_shape(ws, [None, self.num_conv + self.num_torgb, self.w_dim])
+            w_iter = iter(ws.unbind(dim=1))
+            bs = ws.shape[0]
+        else:
+            w_iter = iter(ws)
+            bs = ws[0].shape[0]
         dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
         memory_format = torch.channels_last if self.channels_last and not force_fp32 else torch.contiguous_format
         if fused_modconv is None:
@@ -388,29 +396,29 @@ class SynthesisBlock(torch.nn.Module):
         # Input.
         if self.in_channels == 0:
             x = self.const.to(dtype=dtype, memory_format=memory_format)
-            x = x.unsqueeze(0).repeat([ws.shape[0], 1, 1, 1])
+            x = x.unsqueeze(0).repeat([bs, 1, 1, 1])
         else:
             misc.assert_shape(x, [None, self.in_channels, self.resolution // 2, self.resolution // 2])
             x = x.to(dtype=dtype, memory_format=memory_format)
 
         # Main layers.
         if self.in_channels == 0:
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.conv1(x, next(w_iter), style_input=style_input, fused_modconv=fused_modconv, **layer_kwargs)
         elif self.architecture == 'resnet':
             y = self.skip(x, gain=np.sqrt(0.5))
-            x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
+            x = self.conv0(x, next(w_iter), style_input=style_input, fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.conv1(x, next(w_iter), style_input=style_input, fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
             x = y.add_(x)
         else:
-            x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
-            x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.conv0(x, next(w_iter), style_input=style_input, fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.conv1(x, next(w_iter), style_input=style_input, fused_modconv=fused_modconv, **layer_kwargs)
 
         # ToRGB.
         if img is not None:
             misc.assert_shape(img, [None, self.img_channels, self.resolution // 2, self.resolution // 2])
             img = upfirdn2d.upsample2d(img, self.resample_filter)
         if self.is_last or self.architecture == 'skip':
-            y = self.torgb(x, next(w_iter), fused_modconv=fused_modconv)
+            y = self.torgb(x, next(w_iter), style_input=style_input, fused_modconv=fused_modconv)
             y = y.to(dtype=torch.float32, memory_format=torch.contiguous_format)
             img = img.add_(y) if img is not None else y
 
@@ -454,21 +462,32 @@ class SynthesisNetwork(torch.nn.Module):
                 self.num_ws += block.num_torgb
             setattr(self, f'b{res}', block)
 
-    def forward(self, ws, **block_kwargs):
+    def forward(self, ws, style_input=False, **block_kwargs):
         block_ws = []
         with torch.autograd.profiler.record_function('split_ws'):
-            misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
-            ws = ws.to(torch.float32)
+            if not style_input:
+                misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
+                ws = ws.to(torch.float32)
+
+                w_idx = 0
+                for res in self.block_resolutions:
+                    block = getattr(self, f'b{res}')
+                    block_ws.append(ws.narrow(1, w_idx, block.num_conv + block.num_torgb))
+                    w_idx += block.num_conv
+            else:
+                styles = [w.to(torch.float32) for w in ws]
+
+        x = img = None
+        if not style_input:
+            for res, cur_ws in zip(self.block_resolutions, block_ws):
+                block = getattr(self, f'b{res}')
+                x, img = block(x, img, cur_ws, style_input=style_input, **block_kwargs)
+        else:
             w_idx = 0
             for res in self.block_resolutions:
                 block = getattr(self, f'b{res}')
-                block_ws.append(ws.narrow(1, w_idx, block.num_conv + block.num_torgb))
-                w_idx += block.num_conv
-
-        x = img = None
-        for res, cur_ws in zip(self.block_resolutions, block_ws):
-            block = getattr(self, f'b{res}')
-            x, img = block(x, img, cur_ws, **block_kwargs)
+                cur_styles = styles[w_idx : w_idx + block.num_conv + block.num_torgb]
+                x, img = block(x, img, cur_styles, style_input=style_input, **block_kwargs)
         return img
 
 #----------------------------------------------------------------------------
