@@ -287,7 +287,7 @@ class SynthesisLayer(torch.nn.Module):
         assert noise_mode in ['random', 'const', 'none']
         in_resolution = self.resolution // self.up
         misc.assert_shape(x, [None, self.weight.shape[1], in_resolution, in_resolution])
-        if style_input:
+        if not style_input:
             styles = self.affine(w)
         else:
             styles = w
@@ -320,8 +320,11 @@ class ToRGBLayer(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
         self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
 
-    def forward(self, x, w, fused_modconv=True):
-        styles = self.affine(w) * self.weight_gain
+    def forward(self, x, w, style_input=False, fused_modconv=True):
+        if not style_input:
+            styles = self.affine(w) * self.weight_gain
+        else:
+            styles = w * self.weight_gain
         x = modulated_conv2d(x=x, weight=self.weight, styles=styles, demodulate=False, fused_modconv=fused_modconv)
         x = bias_act.bias_act(x, self.bias.to(x.dtype), clamp=self.conv_clamp)
         return x
